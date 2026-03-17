@@ -1,4 +1,4 @@
-module main
+module github.com/andersns/homomorphic-age-verification
 
 go 1.25.3
 

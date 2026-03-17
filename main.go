@@ -1,88 +1,133 @@
 package main
 
 import (
-	"flag"
+	"crypto/rand"
 	"fmt"
+	"time"
 
 	"github.com/tuneinsight/lattigo/v6/schemes/bgv"
 )
 
-func ageVerification() {
+func main() {
 	fmt.Println("============================================")
-	fmt.Println("Homomorphic Age Verification")
+	fmt.Println("  Homomorphic Age Verification Demo")
+	fmt.Println("  (Threshold Decryption Protocol)")
 	fmt.Println("============================================")
 	fmt.Println()
-	fmt.Println("Protocol: Client encrypts birth date, server verifies age >= 18")
-	fmt.Println("without learning the actual birth date")
+	fmt.Println("Protocol: Client encrypts birth date under a collective public key.")
+	fmt.Println("Server computes age comparison homomorphically and blinds the result.")
+	fmt.Println("Neither party can decrypt alone — both must contribute decryption shares.")
+	fmt.Println("The server combines shares, determines pass/fail, and issues a signed JWT.")
 	fmt.Println()
 
-	// Setup cryptographic parameters (shared by both client and server, for simplicity)
+	// Setup cryptographic parameters (shared between client and server).
+	// PlaintextModulus is a 41-bit NTT-friendly prime, large enough to
+	// support ~24 bits of blinding randomness on day-count encoded dates.
 	params, err := bgv.NewParametersFromLiteral(bgv.ParametersLiteral{
 		LogN:             14,
 		LogQ:             []int{56, 55, 55, 54, 54, 54},
 		LogP:             []int{55, 55},
-		PlaintextModulus: 0x3ee0001,
+		PlaintextModulus: 0x10000048001,
 	})
 	if err != nil {
-		panic(err)
+		panic(fmt.Sprintf("failed to create parameters: %v", err))
 	}
 
-	currentDate := uint64(20251124) // November 24, 2025, just hard code for the demo
-	server := NewServer(params, currentDate)
+	// Step 1: Threshold key generation ceremony.
+	// In a real deployment this is an interactive protocol over a network.
+	// Both parties contribute to the collective public key without revealing
+	// their secret key shares.
+	fmt.Println("--- Threshold Setup ---")
+	crsSeed := make([]byte, 32)
+	if _, err := rand.Read(crsSeed); err != nil {
+		panic(fmt.Sprintf("failed to generate CRS seed: %v", err))
+	}
+
+	setup, err := GenerateThresholdSetup(params, crsSeed)
+	if err != nil {
+		panic(fmt.Sprintf("failed threshold setup: %v", err))
+	}
+	fmt.Println("  Collective public key generated (2-of-2 threshold)")
+	fmt.Println()
+
+	currentDate := time.Date(2025, 11, 24, 0, 0, 0, 0, time.UTC)
+	ageThreshold := uint64(18)
+	server, err := NewServer(params, currentDate, ageThreshold, setup.ServerSecretKey)
+	if err != nil {
+		panic(fmt.Sprintf("failed to create server: %v", err))
+	}
 
 	testCases := []struct {
-		birthDate   uint64
+		birthDate   time.Time
 		description string
 		shouldPass  bool
 	}{
-		{20071125, "Person born Nov 25, 2007 (day after threshold)", false},
-		{20071124, "Person born Nov 24, 2007 (exactly 18 today)", true},
-		{20071123, "Person born Nov 23, 2007 (turned 18 yesterday)", true},
-		{19871025, "Person born Oct 25, 1987 (👴)", true},
-		{20100515, "Person born May 15, 2010 (15 years old)", false},
+		{time.Date(2007, 11, 25, 0, 0, 0, 0, time.UTC), "Born Nov 25, 2007 (one day too young)", false},
+		{time.Date(2007, 11, 24, 0, 0, 0, 0, time.UTC), "Born Nov 24, 2007 (exactly 18 today)", true},
+		{time.Date(2007, 11, 23, 0, 0, 0, 0, time.UTC), "Born Nov 23, 2007 (turned 18 yesterday)", true},
+		{time.Date(1987, 10, 25, 0, 0, 0, 0, time.UTC), "Born Oct 25, 1987 (38 years old)", true},
+		{time.Date(2010, 5, 15, 0, 0, 0, 0, time.UTC), "Born May 15, 2010 (15 years old)", false},
 	}
 
 	for _, tc := range testCases {
-		fmt.Println("============================================")
-		fmt.Println("============================================")
-		fmt.Printf("Example: %s\n", tc.description)
-		fmt.Println("============================================")
-		fmt.Println("============================================")
-		fmt.Println()
+		fmt.Println("--------------------------------------------")
+		fmt.Printf("Test: %s\n", tc.description)
 
-		fmt.Println("--- CLIENT SIDE ---")
-		testClient := NewClient(params, tc.birthDate)
-		fmt.Printf("[CLIENT] My birth date: %d\n", tc.birthDate)
-
-		testRequest, err := testClient.CreateRequest()
+		// Step 2: Client encrypts birth date under the collective public key.
+		client, err := NewClient(params, tc.birthDate, setup.ClientSecretKey, setup.CollectivePublicKey)
 		if err != nil {
-			panic(err)
+			panic(fmt.Sprintf("failed to create client: %v", err))
 		}
 
-		fmt.Println(">>> Sending to server...")
-		fmt.Println()
-
-		fmt.Println("--- SERVER SIDE ---")
-		testResponse, err := server.VerifyAge(testRequest)
+		request, err := client.CreateRequest()
 		if err != nil {
-			panic(err)
+			panic(fmt.Sprintf("failed to create request: %v", err))
 		}
 
-		fmt.Println("<<< Sending response to client...")
-		fmt.Println()
-
-		fmt.Println("--- CLIENT SIDE (processing response)---")
-		testVerified, err := testClient.ProcessResponse(testResponse)
+		// Step 3: Server computes homomorphically (blinded age comparison).
+		response, err := server.VerifyAge(request)
 		if err != nil {
-			panic(err)
+			panic(fmt.Sprintf("failed to verify age: %v", err))
 		}
 
-		fmt.Printf("[DEMO] Verification correct: %t\n", testVerified == tc.shouldPass)
-		fmt.Println()
+		// Step 4: Client generates its decryption share.
+		clientShare, err := client.GenDecryptionShare(response.EncryptedResult)
+		if err != nil {
+			panic(fmt.Sprintf("failed to generate decryption share: %v", err))
+		}
+
+		// Step 5: Server combines decryption shares, determines pass/fail,
+		// and issues a signed attestation.
+		attestation, err := server.CompleteVerification(&DecryptionRequest{
+			SessionID:   response.SessionID,
+			ClientShare: clientShare,
+		})
+		if err != nil {
+			panic(fmt.Sprintf("failed to complete verification: %v", err))
+		}
+
+		result := "REJECTED"
+		if attestation.Verified {
+			result = "VERIFIED"
+		}
+
+		status := "PASS"
+		if attestation.Verified != tc.shouldPass {
+			status = "FAIL"
+		}
+
+		fmt.Printf("  Result: %s | Expected: %v | %s\n", result, tc.shouldPass, status)
+
+		// Step 6: Relying party verifies the attestation token.
+		claims, err := VerifyAttestation(attestation.Token, server.PublicKey())
+		if err != nil {
+			panic(fmt.Sprintf("failed to verify attestation: %v", err))
+		}
+
+		fmt.Printf("  Attestation: verified=%v, age>=%d\n",
+			claims.Verified, claims.AgeThreshold)
 	}
-}
 
-func main() {
-	flag.Parse()
-	ageVerification()
+	fmt.Println("--------------------------------------------")
+	fmt.Println("Done.")
 }
