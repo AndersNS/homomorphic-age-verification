@@ -29,11 +29,13 @@ type DecryptionShare struct {
 }
 
 // DecryptionRequest is sent by the client after receiving the server's response.
-// It contains the client's decryption share so the server can combine it with
-// its own share to decrypt the result.
+// It contains the blinded ciphertext (the client multiplied the server's result
+// by a random factor) and the client's decryption share for that blinded
+// ciphertext. The server combines it with its own share to decrypt.
 type DecryptionRequest struct {
-	SessionID   string
-	ClientShare *DecryptionShare
+	SessionID     string
+	ClientShare   *DecryptionShare
+	BlindedResult *rlwe.Ciphertext
 }
 
 // Attestation is a signed JWT token proving that a client passed (or failed)

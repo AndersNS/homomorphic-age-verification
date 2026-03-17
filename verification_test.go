@@ -18,8 +18,17 @@ import (
 // is expensive, so we do it once.
 var testParams bgv.Parameters
 
-// testSetup holds the shared threshold keys for tests.
-var testSetup *ThresholdSetup
+// testClientSK and testServerSK are the threshold secret key shares for tests.
+var (
+	testClientSK *rlwe.SecretKey
+	testServerSK *rlwe.SecretKey
+)
+
+// testCollectivePK is the collective public key for tests.
+var testCollectivePK *rlwe.PublicKey
+
+// testCurrentDate is the reference "today" for tests.
+var testCurrentDate = date(2025, 11, 24)
 
 func TestMain(m *testing.M) {
 	var err error
@@ -33,12 +42,25 @@ func TestMain(m *testing.M) {
 		panic("failed to create test parameters: " + err.Error())
 	}
 
-	testSetup, err = GenerateThresholdSetup(testParams, []byte("test-crs-seed-for-determinism"))
-	if err != nil {
-		panic("failed threshold setup: " + err.Error())
-	}
+	testClientSK, testServerSK, testCollectivePK = generateTestKeys(testParams, []byte("test-crs-seed-for-determinism"))
 
 	os.Exit(m.Run())
+}
+
+// generateTestKeys runs the two-participant CKG ceremony and returns the
+// secret keys and collective public key. This is a test helper that simulates
+// the network exchange between client and server.
+func generateTestKeys(params bgv.Parameters, crsSeed []byte) (*rlwe.SecretKey, *rlwe.SecretKey, *rlwe.PublicKey) {
+	clientP, err := NewCKGParticipant(params, crsSeed)
+	if err != nil {
+		panic("client CKG participant: " + err.Error())
+	}
+	serverP, err := NewCKGParticipant(params, crsSeed)
+	if err != nil {
+		panic("server CKG participant: " + err.Error())
+	}
+	pk := clientP.CombineShares(serverP.Share())
+	return clientP.SecretKey(), serverP.SecretKey(), pk
 }
 
 // date is a convenience constructor for UTC dates in tests.
@@ -49,7 +71,7 @@ func date(year, month, day int) time.Time {
 // newTestServer creates a Server for tests, failing immediately on error.
 func newTestServer(t testing.TB, currentDate time.Time, ageThreshold uint64) *Server {
 	t.Helper()
-	server, err := NewServer(testParams, currentDate, ageThreshold, testSetup.ServerSecretKey)
+	server, err := NewServer(testParams, currentDate, ageThreshold, testServerSK)
 	if err != nil {
 		t.Fatalf("NewServer() error: %v", err)
 	}
@@ -59,7 +81,7 @@ func newTestServer(t testing.TB, currentDate time.Time, ageThreshold uint64) *Se
 // newTestClient creates a Client for tests, failing immediately on error.
 func newTestClient(t testing.TB, birthDate time.Time) *Client {
 	t.Helper()
-	client, err := NewClient(testParams, birthDate, testSetup.ClientSecretKey, testSetup.CollectivePublicKey)
+	client, err := NewClient(testParams, birthDate, testClientSK, testCollectivePK, testCurrentDate)
 	if err != nil {
 		t.Fatalf("NewClient() error: %v", err)
 	}
@@ -83,14 +105,15 @@ func runVerification(t *testing.T, server *Server, birthDate time.Time) (*Attest
 		t.Fatalf("VerifyAge() error: %v", err)
 	}
 
-	clientShare, err := client.GenDecryptionShare(response.EncryptedResult)
+	blindedResult, clientShare, err := client.BlindAndGenShare(response.EncryptedResult)
 	if err != nil {
-		t.Fatalf("GenDecryptionShare() error: %v", err)
+		t.Fatalf("BlindAndGenShare() error: %v", err)
 	}
 
 	attestation, err := server.CompleteVerification(&DecryptionRequest{
-		SessionID:   response.SessionID,
-		ClientShare: clientShare,
+		SessionID:     response.SessionID,
+		ClientShare:   clientShare,
+		BlindedResult: blindedResult,
 	})
 	if err != nil {
 		t.Fatalf("CompleteVerification() error: %v", err)
@@ -100,8 +123,7 @@ func runVerification(t *testing.T, server *Server, birthDate time.Time) (*Attest
 }
 
 func TestAgeVerification(t *testing.T) {
-	currentDate := date(2025, 11, 24)
-	server := newTestServer(t, currentDate, 18)
+	server := newTestServer(t, testCurrentDate, 18)
 
 	tests := []struct {
 		name       string
@@ -131,8 +153,7 @@ func TestAgeVerification(t *testing.T) {
 }
 
 func TestAgeVerificationCustomThreshold(t *testing.T) {
-	currentDate := date(2025, 11, 24)
-	server := newTestServer(t, currentDate, 21) // drinking age
+	server := newTestServer(t, testCurrentDate, 21) // drinking age
 
 	tests := []struct {
 		name       string
@@ -156,21 +177,12 @@ func TestAgeVerificationCustomThreshold(t *testing.T) {
 }
 
 func TestBlindingPreventsThresholdRecovery(t *testing.T) {
-	// Run the same verification multiple times and confirm the blinded
-	// result varies each time (due to random blinding factor).
-	// We do this by completing the full flow and checking that the server
-	// internally sees different blinded values. Since we can't directly
-	// inspect the server's decrypted value, we verify that the encrypted
-	// results (which contain different random blinds) differ.
-	currentDate := date(2025, 11, 24)
-	server := newTestServer(t, currentDate, 18)
+	// Run the same verification multiple times and confirm the client's
+	// blinding produces different blinded ciphertexts each time.
+	server := newTestServer(t, testCurrentDate, 18)
 
 	birthDate := date(1990, 1, 15)
 	client := newTestClient(t, birthDate)
-
-	type resultPair struct {
-		verified bool
-	}
 
 	for i := 0; i < 5; i++ {
 		request, err := client.CreateRequest()
@@ -183,14 +195,15 @@ func TestBlindingPreventsThresholdRecovery(t *testing.T) {
 			t.Fatalf("VerifyAge() error: %v", err)
 		}
 
-		clientShare, err := client.GenDecryptionShare(response.EncryptedResult)
+		blindedResult, clientShare, err := client.BlindAndGenShare(response.EncryptedResult)
 		if err != nil {
-			t.Fatalf("GenDecryptionShare() error: %v", err)
+			t.Fatalf("BlindAndGenShare() error: %v", err)
 		}
 
 		attestation, err := server.CompleteVerification(&DecryptionRequest{
-			SessionID:   response.SessionID,
-			ClientShare: clientShare,
+			SessionID:     response.SessionID,
+			ClientShare:   clientShare,
+			BlindedResult: blindedResult,
 		})
 		if err != nil {
 			t.Fatalf("CompleteVerification() error: %v", err)
@@ -203,8 +216,7 @@ func TestBlindingPreventsThresholdRecovery(t *testing.T) {
 }
 
 func TestAttestationFlow(t *testing.T) {
-	currentDate := date(2025, 11, 24)
-	server := newTestServer(t, currentDate, 18)
+	server := newTestServer(t, testCurrentDate, 18)
 
 	tests := []struct {
 		name       string
@@ -243,9 +255,7 @@ func TestAttestationFlow(t *testing.T) {
 }
 
 func TestSessionIsOneTimeUse(t *testing.T) {
-	currentDate := date(2025, 11, 24)
-	server := newTestServer(t, currentDate, 18)
-
+	server := newTestServer(t, testCurrentDate, 18)
 	client := newTestClient(t, date(1990, 1, 15))
 
 	request, err := client.CreateRequest()
@@ -258,15 +268,16 @@ func TestSessionIsOneTimeUse(t *testing.T) {
 		t.Fatalf("VerifyAge() error: %v", err)
 	}
 
-	clientShare, err := client.GenDecryptionShare(response.EncryptedResult)
+	blindedResult, clientShare, err := client.BlindAndGenShare(response.EncryptedResult)
 	if err != nil {
-		t.Fatalf("GenDecryptionShare() error: %v", err)
+		t.Fatalf("BlindAndGenShare() error: %v", err)
 	}
 
 	// First completion should succeed.
 	_, err = server.CompleteVerification(&DecryptionRequest{
-		SessionID:   response.SessionID,
-		ClientShare: clientShare,
+		SessionID:     response.SessionID,
+		ClientShare:   clientShare,
+		BlindedResult: blindedResult,
 	})
 	if err != nil {
 		t.Fatalf("first CompleteVerification() error: %v", err)
@@ -274,8 +285,9 @@ func TestSessionIsOneTimeUse(t *testing.T) {
 
 	// Second attempt with the same session should fail (consumed).
 	_, err = server.CompleteVerification(&DecryptionRequest{
-		SessionID:   response.SessionID,
-		ClientShare: clientShare,
+		SessionID:     response.SessionID,
+		ClientShare:   clientShare,
+		BlindedResult: blindedResult,
 	})
 	if err == nil {
 		t.Error("expected error on reuse of session ID, got nil")
@@ -283,10 +295,9 @@ func TestSessionIsOneTimeUse(t *testing.T) {
 }
 
 func TestCompleteVerificationRejectsInvalidSession(t *testing.T) {
-	currentDate := date(2025, 11, 24)
-	server := newTestServer(t, currentDate, 18)
+	server := newTestServer(t, testCurrentDate, 18)
 
-	// Create a dummy share to send with a bogus session ID.
+	// Create a dummy share and ciphertext to send with a bogus session ID.
 	cks, err := multiparty.NewKeySwitchProtocol(testParams, ring.DiscreteGaussian{
 		Sigma: noiseFloodingSigma,
 		Bound: noiseFloodingSigma * 6,
@@ -296,10 +307,12 @@ func TestCompleteVerificationRejectsInvalidSession(t *testing.T) {
 	}
 
 	share := cks.AllocateShare(testParams.MaxLevel())
+	dummyCt := bgv.NewCiphertext(testParams, 1, testParams.MaxLevel())
 
 	_, err = server.CompleteVerification(&DecryptionRequest{
-		SessionID:   "nonexistent-session-id",
-		ClientShare: &DecryptionShare{Share: share},
+		SessionID:     "nonexistent-session-id",
+		ClientShare:   &DecryptionShare{Share: share},
+		BlindedResult: dummyCt,
 	})
 	if err == nil {
 		t.Error("expected error for invalid session ID, got nil")
@@ -307,8 +320,7 @@ func TestCompleteVerificationRejectsInvalidSession(t *testing.T) {
 }
 
 func TestAttestationRejectsWrongPublicKey(t *testing.T) {
-	currentDate := date(2025, 11, 24)
-	server := newTestServer(t, currentDate, 18)
+	server := newTestServer(t, testCurrentDate, 18)
 
 	attestation, _ := runVerification(t, server, date(1990, 1, 15))
 
@@ -334,7 +346,7 @@ func TestNewClientValidation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := NewClient(testParams, tt.birthDate, testSetup.ClientSecretKey, testSetup.CollectivePublicKey)
+			_, err := NewClient(testParams, tt.birthDate, testClientSK, testCollectivePK, testCurrentDate)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("NewClient(%s) error = %v, wantErr %v",
 					tt.birthDate.Format("2006-01-02"), err, tt.wantErr)
@@ -367,8 +379,7 @@ func TestDateToDays(t *testing.T) {
 }
 
 func TestAttestationRejectsTamperedJWT(t *testing.T) {
-	currentDate := date(2025, 11, 24)
-	server := newTestServer(t, currentDate, 18)
+	server := newTestServer(t, testCurrentDate, 18)
 
 	attestation, _ := runVerification(t, server, date(2010, 5, 15))
 
@@ -386,8 +397,7 @@ func TestAttestationRejectsTamperedJWT(t *testing.T) {
 }
 
 func TestVerifyAgeRejectsNilRequest(t *testing.T) {
-	currentDate := date(2025, 11, 24)
-	server := newTestServer(t, currentDate, 18)
+	server := newTestServer(t, testCurrentDate, 18)
 
 	_, err := server.VerifyAge(nil)
 	if err == nil {
@@ -400,22 +410,50 @@ func TestVerifyAgeRejectsNilRequest(t *testing.T) {
 	}
 }
 
-func TestGenDecryptionShareRejectsNilCiphertext(t *testing.T) {
+func TestBlindAndGenShareRejectsNilCiphertext(t *testing.T) {
 	client := newTestClient(t, date(1990, 1, 15))
 
-	_, err := client.GenDecryptionShare(nil)
+	_, _, err := client.BlindAndGenShare(nil)
 	if err == nil {
 		t.Error("expected error for nil ciphertext, got nil")
 	}
 }
 
 func TestCompleteVerificationRejectsNilRequest(t *testing.T) {
-	currentDate := date(2025, 11, 24)
-	server := newTestServer(t, currentDate, 18)
+	server := newTestServer(t, testCurrentDate, 18)
 
 	_, err := server.CompleteVerification(nil)
 	if err == nil {
 		t.Error("expected error for nil decryption request, got nil")
+	}
+}
+
+func TestCompleteVerificationRejectsNilBlindedResult(t *testing.T) {
+	server := newTestServer(t, testCurrentDate, 18)
+
+	client := newTestClient(t, date(1990, 1, 15))
+	request, err := client.CreateRequest()
+	if err != nil {
+		t.Fatalf("CreateRequest() error: %v", err)
+	}
+
+	response, err := server.VerifyAge(request)
+	if err != nil {
+		t.Fatalf("VerifyAge() error: %v", err)
+	}
+
+	_, clientShare, err := client.BlindAndGenShare(response.EncryptedResult)
+	if err != nil {
+		t.Fatalf("BlindAndGenShare() error: %v", err)
+	}
+
+	_, err = server.CompleteVerification(&DecryptionRequest{
+		SessionID:     response.SessionID,
+		ClientShare:   clientShare,
+		BlindedResult: nil,
+	})
+	if err == nil {
+		t.Error("expected error for nil blinded ciphertext, got nil")
 	}
 }
 
@@ -435,9 +473,7 @@ func TestDateToDaysNonUTC(t *testing.T) {
 }
 
 func TestSessionExpiry(t *testing.T) {
-	currentDate := date(2025, 11, 24)
-	server := newTestServer(t, currentDate, 18)
-
+	server := newTestServer(t, testCurrentDate, 18)
 	client := newTestClient(t, date(1990, 1, 15))
 
 	request, err := client.CreateRequest()
@@ -450,20 +486,20 @@ func TestSessionExpiry(t *testing.T) {
 		t.Fatalf("VerifyAge() error: %v", err)
 	}
 
-	clientShare, err := client.GenDecryptionShare(response.EncryptedResult)
+	blindedResult, clientShare, err := client.BlindAndGenShare(response.EncryptedResult)
 	if err != nil {
-		t.Fatalf("GenDecryptionShare() error: %v", err)
+		t.Fatalf("BlindAndGenShare() error: %v", err)
 	}
 
 	// Manually expire the session by replacing it with an old createdAt.
 	server.sessions.Store(response.SessionID, session{
-		encryptedResult: response.EncryptedResult,
-		createdAt:       time.Now().Add(-sessionTTL - time.Second),
+		createdAt: time.Now().Add(-sessionTTL - time.Second),
 	})
 
 	_, err = server.CompleteVerification(&DecryptionRequest{
-		SessionID:   response.SessionID,
-		ClientShare: clientShare,
+		SessionID:     response.SessionID,
+		ClientShare:   clientShare,
+		BlindedResult: blindedResult,
 	})
 	if err == nil {
 		t.Error("expected error for expired session, got nil")
@@ -471,8 +507,7 @@ func TestSessionExpiry(t *testing.T) {
 }
 
 func TestJWTRejectsWrongAlgorithmHeader(t *testing.T) {
-	currentDate := date(2025, 11, 24)
-	server := newTestServer(t, currentDate, 18)
+	server := newTestServer(t, testCurrentDate, 18)
 
 	attestation, _ := runVerification(t, server, date(1990, 1, 15))
 
@@ -487,37 +522,24 @@ func TestJWTRejectsWrongAlgorithmHeader(t *testing.T) {
 	}
 }
 
-func TestThresholdSetup(t *testing.T) {
-	setup, err := GenerateThresholdSetup(testParams, []byte("test-seed"))
+func TestCKGParticipant(t *testing.T) {
+	p, err := NewCKGParticipant(testParams, []byte("test-seed"))
 	if err != nil {
-		t.Fatalf("GenerateThresholdSetup() error: %v", err)
+		t.Fatalf("NewCKGParticipant() error: %v", err)
 	}
 
-	if setup.ClientSecretKey == nil {
-		t.Error("ClientSecretKey is nil")
-	}
-	if setup.ServerSecretKey == nil {
-		t.Error("ServerSecretKey is nil")
-	}
-	if setup.CollectivePublicKey == nil {
-		t.Error("CollectivePublicKey is nil")
+	if p.SecretKey() == nil {
+		t.Error("SecretKey is nil")
 	}
 }
 
-func TestThresholdSetupDifferentSeedsProduceDifferentKeys(t *testing.T) {
-	setup1, err := GenerateThresholdSetup(testParams, []byte("seed-one"))
-	if err != nil {
-		t.Fatalf("GenerateThresholdSetup(1) error: %v", err)
-	}
-
-	setup2, err := GenerateThresholdSetup(testParams, []byte("seed-two"))
-	if err != nil {
-		t.Fatalf("GenerateThresholdSetup(2) error: %v", err)
-	}
+func TestCKGDifferentSeedsProduceDifferentKeys(t *testing.T) {
+	_, _, pk1 := generateTestKeys(testParams, []byte("seed-one"))
+	_, _, pk2 := generateTestKeys(testParams, []byte("seed-two"))
 
 	// The collective public keys should differ.
-	pk1Bytes, _ := setup1.CollectivePublicKey.MarshalBinary()
-	pk2Bytes, _ := setup2.CollectivePublicKey.MarshalBinary()
+	pk1Bytes, _ := pk1.MarshalBinary()
+	pk2Bytes, _ := pk2.MarshalBinary()
 
 	if string(pk1Bytes) == string(pk2Bytes) {
 		t.Error("expected different collective public keys for different seeds")
@@ -527,11 +549,8 @@ func TestThresholdSetupDifferentSeedsProduceDifferentKeys(t *testing.T) {
 func TestWrongDecryptionShareProducesGarbage(t *testing.T) {
 	// If the client sends a decryption share from the wrong secret key,
 	// the result should be garbage (not a valid pass/fail). The server
-	// will still produce an attestation, but the result is meaningless —
-	// the protocol's integrity relies on both parties being honest about
-	// their key shares.
-	currentDate := date(2025, 11, 24)
-	server := newTestServer(t, currentDate, 18)
+	// will still produce an attestation, but the result is meaningless.
+	server := newTestServer(t, testCurrentDate, 18)
 
 	// Use the correct setup for the client request/encryption.
 	client := newTestClient(t, date(1990, 1, 15))
@@ -546,11 +565,14 @@ func TestWrongDecryptionShareProducesGarbage(t *testing.T) {
 		t.Fatalf("VerifyAge() error: %v", err)
 	}
 
-	// Generate a decryption share using a WRONG secret key.
-	wrongSetup, err := GenerateThresholdSetup(testParams, []byte("wrong-seed"))
+	// Client blinds correctly but we'll replace the share with one from a wrong key.
+	blindedResult, _, err := client.BlindAndGenShare(response.EncryptedResult)
 	if err != nil {
-		t.Fatalf("GenerateThresholdSetup() error: %v", err)
+		t.Fatalf("BlindAndGenShare() error: %v", err)
 	}
+
+	// Generate a decryption share using a WRONG secret key.
+	wrongClientSK, _, _ := generateTestKeys(testParams, []byte("wrong-seed"))
 
 	wrongCKS, err := multiparty.NewKeySwitchProtocol(testParams, ring.DiscreteGaussian{
 		Sigma: noiseFloodingSigma,
@@ -561,45 +583,42 @@ func TestWrongDecryptionShareProducesGarbage(t *testing.T) {
 	}
 
 	zero := rlwe.NewSecretKey(testParams)
-	wrongShare := wrongCKS.AllocateShare(response.EncryptedResult.Level())
-	wrongCKS.GenShare(wrongSetup.ClientSecretKey, zero, response.EncryptedResult, &wrongShare)
+	wrongShare := wrongCKS.AllocateShare(blindedResult.Level())
+	wrongCKS.GenShare(wrongClientSK, zero, blindedResult, &wrongShare)
 
 	// The server should still complete (it can't tell the share is wrong),
 	// but the decrypted value is garbage.
 	attestation, err := server.CompleteVerification(&DecryptionRequest{
-		SessionID:   response.SessionID,
-		ClientShare: &DecryptionShare{Share: wrongShare},
+		SessionID:     response.SessionID,
+		ClientShare:   &DecryptionShare{Share: wrongShare},
+		BlindedResult: blindedResult,
 	})
 	if err != nil {
 		t.Fatalf("CompleteVerification() error: %v", err)
 	}
 
-	// We can't predict the outcome — it's random garbage. Just verify
+	// We can't predict the outcome -- it's random garbage. Just verify
 	// the flow completes without panicking.
 	_ = attestation
 }
 
 func TestEndToEndWithFreshSetup(t *testing.T) {
-	// Full end-to-end test using a freshly generated threshold setup,
-	// independent of the global testSetup.
+	// Full end-to-end test using freshly generated keys,
+	// independent of the global test keys.
 	crsSeed := make([]byte, 32)
 	if _, err := rand.Read(crsSeed); err != nil {
 		t.Fatalf("rand.Read() error: %v", err)
 	}
 
-	setup, err := GenerateThresholdSetup(testParams, crsSeed)
-	if err != nil {
-		t.Fatalf("GenerateThresholdSetup() error: %v", err)
-	}
+	clientSK, serverSK, pk := generateTestKeys(testParams, crsSeed)
 
-	currentDate := date(2025, 11, 24)
-	server, err := NewServer(testParams, currentDate, 18, setup.ServerSecretKey)
+	server, err := NewServer(testParams, testCurrentDate, 18, serverSK)
 	if err != nil {
 		t.Fatalf("NewServer() error: %v", err)
 	}
 
 	birthDate := date(1990, 1, 15)
-	client, err := NewClient(testParams, birthDate, setup.ClientSecretKey, setup.CollectivePublicKey)
+	client, err := NewClient(testParams, birthDate, clientSK, pk, testCurrentDate)
 	if err != nil {
 		t.Fatalf("NewClient() error: %v", err)
 	}
@@ -614,14 +633,15 @@ func TestEndToEndWithFreshSetup(t *testing.T) {
 		t.Fatalf("VerifyAge() error: %v", err)
 	}
 
-	clientShare, err := client.GenDecryptionShare(response.EncryptedResult)
+	blindedResult, clientShare, err := client.BlindAndGenShare(response.EncryptedResult)
 	if err != nil {
-		t.Fatalf("GenDecryptionShare() error: %v", err)
+		t.Fatalf("BlindAndGenShare() error: %v", err)
 	}
 
 	attestation, err := server.CompleteVerification(&DecryptionRequest{
-		SessionID:   response.SessionID,
-		ClientShare: clientShare,
+		SessionID:     response.SessionID,
+		ClientShare:   clientShare,
+		BlindedResult: blindedResult,
 	})
 	if err != nil {
 		t.Fatalf("CompleteVerification() error: %v", err)
@@ -646,8 +666,7 @@ func TestEndToEndWithFreshSetup(t *testing.T) {
 }
 
 func BenchmarkFullVerification(b *testing.B) {
-	currentDate := date(2025, 11, 24)
-	server := newTestServer(b, currentDate, 18)
+	server := newTestServer(b, testCurrentDate, 18)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -663,14 +682,15 @@ func BenchmarkFullVerification(b *testing.B) {
 			b.Fatal(err)
 		}
 
-		clientShare, err := client.GenDecryptionShare(response.EncryptedResult)
+		blindedResult, clientShare, err := client.BlindAndGenShare(response.EncryptedResult)
 		if err != nil {
 			b.Fatal(err)
 		}
 
 		_, err = server.CompleteVerification(&DecryptionRequest{
-			SessionID:   response.SessionID,
-			ClientShare: clientShare,
+			SessionID:     response.SessionID,
+			ClientShare:   clientShare,
+			BlindedResult: blindedResult,
 		})
 		if err != nil {
 			b.Fatal(err)
@@ -680,7 +700,7 @@ func BenchmarkFullVerification(b *testing.B) {
 
 func BenchmarkKeyGeneration(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		_, err := NewClient(testParams, date(1990, 1, 15), testSetup.ClientSecretKey, testSetup.CollectivePublicKey)
+		_, err := NewClient(testParams, date(1990, 1, 15), testClientSK, testCollectivePK, testCurrentDate)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -700,8 +720,7 @@ func BenchmarkEncryption(b *testing.B) {
 }
 
 func BenchmarkServerComputation(b *testing.B) {
-	currentDate := date(2025, 11, 24)
-	server := newTestServer(b, currentDate, 18)
+	server := newTestServer(b, testCurrentDate, 18)
 
 	client := newTestClient(b, date(1990, 1, 15))
 	request, err := client.CreateRequest()
@@ -720,9 +739,6 @@ func BenchmarkServerComputation(b *testing.B) {
 
 func BenchmarkThresholdSetup(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		_, err := GenerateThresholdSetup(testParams, []byte("bench-seed"))
-		if err != nil {
-			b.Fatal(err)
-		}
+		generateTestKeys(testParams, []byte("bench-seed"))
 	}
 }
