@@ -23,11 +23,8 @@ type AttestationClaims struct {
 	// ExpiresAt is the Unix timestamp when the attestation expires.
 	ExpiresAt int64 `json:"exp"`
 
-	// Verified is true if the client met the age threshold.
+	// Verified is true if the client met the age requirement.
 	Verified bool `json:"verified"`
-
-	// AgeThreshold is the minimum age that was checked (e.g., 18).
-	AgeThreshold uint64 `json:"age_threshold"`
 }
 
 // jwtHeader is the fixed JWT header for Ed25519-signed tokens.
@@ -49,8 +46,10 @@ func signJWT(claims *AttestationClaims, privateKey ed25519.PrivateKey) (string, 
 	return signingInput + "." + sig, nil
 }
 
-// verifyJWT verifies a JWT signature and returns the decoded claims.
-// It validates that the header specifies the EdDSA algorithm.
+/*
+verifyJWT verifies a JWT signature and returns the decoded claims.
+It validates that the header specifies the EdDSA algorithm.
+*/
 func verifyJWT(token string, publicKey ed25519.PublicKey) (*AttestationClaims, error) {
 	parts := strings.SplitN(token, ".", 3)
 	if len(parts) != 3 {
